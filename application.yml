@@ -1,0 +1,4 @@
+app:
+  jwt:
+    secret: ${JWT_SECRET:my-first-springboot-project-in-a-while}
+    expiration-ms: 86400000
