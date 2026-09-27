@@ -5,11 +5,13 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 @Repository
 public interface GroupMemberRepository extends JpaRepository<GroupMember, UUID> {
     boolean existsByGroupGroupIdAndUserUserId(UUID groupId, UUID userId);
+    Optional<GroupMember> findByGroupGroupIdAndUserUserId(UUID groupId, UUID userId);
 
     /**
      * Finds all membership records for a group — one per member.
