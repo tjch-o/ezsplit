@@ -24,7 +24,8 @@ public class GroupController {
 
     @PostMapping
     public ResponseEntity<GroupResponse> createGroup(@Valid @RequestBody CreateGroupRequest req, @AuthenticationPrincipal User caller) {
-        return ResponseEntity.status(HttpStatus.CREATED).body(groupService.create(req, caller.getUserId()));
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(groupService.create(req, caller.getUserId()));
     }
 
     @GetMapping
