@@ -10,6 +10,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.OptimisticLockingFailureException;
 
 import java.math.BigDecimal;
 import java.util.List;
@@ -36,6 +37,9 @@ class ExpenseServiceTest {
     private final UUID bobId   = UUID.randomUUID();
     private final UUID carolId = UUID.randomUUID();
 
+    // ═════════════════════════════════════════════════════════
+    // CREATE
+    // ═════════════════════════════════════════════════════════
     @Test
     void equalSplit_shouldDivideEvenly_whenDivisible() {
         setupGroupAndMembers();
@@ -65,7 +69,7 @@ class ExpenseServiceTest {
         assertThat(saved.get(0).getAmountOwed()).isEqualByComparingTo("3.33");
         assertThat(saved.get(1).getAmountOwed()).isEqualByComparingTo("3.33");
         assertThat(saved.get(2).getAmountOwed()).isEqualByComparingTo("3.34");
-        assertThat(sumOf(saved)).isEqualByComparingTo("10.00");   // the invariant
+        assertThat(sumOf(saved)).isEqualByComparingTo("10.00");
     }
 
     @Test
@@ -107,7 +111,6 @@ class ExpenseServiceTest {
     void percentageSplit_shouldHandleRoundingDrift() {
         setupGroupAndMembers();
 
-        // $10 split as 33.33/33.33/33.34
         CreateExpenseRequest req = baseRequest(SplitMethod.PERCENTAGE, "10.00", aliceId);
         req.setParticipants(List.of(
                 pct(aliceId, "33.33"),
@@ -172,6 +175,10 @@ class ExpenseServiceTest {
                 .hasMessageContaining("greater than zero");
     }
 
+    // ═════════════════════════════════════════════════════════
+    // CREATE — authorization
+    // ═════════════════════════════════════════════════════════
+
     @Test
     void create_shouldThrow_whenCallerIsNotGroupMember() {
         Group group = Group.builder().groupId(groupId).currency("SGD").build();
@@ -206,18 +213,150 @@ class ExpenseServiceTest {
                 .hasMessageContaining("not a member");
     }
 
-    // ─────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════
+    // UPDATE
+    // ═════════════════════════════════════════════════════════
+    @Test
+    void update_shouldReplaceSplits_whenValid() {
+        setupGroupAndMembers();
+
+        UUID expenseId = UUID.randomUUID();
+        Expense existing = existingExpense(groupId, aliceId, 3L);
+        existing.setExpenseId(expenseId);
+
+        when(expenseRepository.findById(expenseId)).thenReturn(Optional.of(existing));
+        when(expenseRepository.saveAndFlush(any(Expense.class)))
+                .thenAnswer(inv -> inv.getArgument(0));
+        when(expenseSplitRepository.findAllByExpenseExpenseId(expenseId))
+                .thenReturn(List.of());
+
+        CreateExpenseRequest req = baseRequest(SplitMethod.EQUAL, "90.00", aliceId);
+        req.setDescription("Dinner — updated");
+        req.setParticipants(List.of(share(aliceId), share(bobId), share(carolId)));
+
+        expenseService.update(groupId, expenseId, req, aliceId);
+
+        // Old splits were deleted
+        verify(expenseSplitRepository).deleteAllByExpenseExpenseId(expenseId);
+
+        // New splits were saved with the new total
+        List<ExpenseSplit> saved = captureSavedSplits();
+        assertThat(saved).hasSize(3);
+        saved.forEach(s -> assertThat(s.getAmountOwed()).isEqualByComparingTo("30.00"));
+        assertThat(sumOf(saved)).isEqualByComparingTo("90.00");
+    }
+
+    @Test
+    void update_shouldThrow_whenCallerIsNotGroupMember() {
+        when(groupMemberRepository.existsByGroupGroupIdAndUserUserId(groupId, aliceId))
+                .thenReturn(false);
+
+        CreateExpenseRequest req = baseRequest(SplitMethod.EQUAL, "60.00", aliceId);
+        req.setParticipants(List.of(share(aliceId)));
+
+        assertThatThrownBy(() ->
+                expenseService.update(groupId, UUID.randomUUID(), req, aliceId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("not a member");
+    }
+
+    @Test
+    void update_shouldThrow_whenExpenseDoesNotExist() {
+        setupGroupAndMembers();
+
+        UUID expenseId = UUID.randomUUID();
+        when(expenseRepository.findById(expenseId)).thenReturn(Optional.empty());
+
+        CreateExpenseRequest req = baseRequest(SplitMethod.EQUAL, "60.00", aliceId);
+        req.setParticipants(List.of(share(aliceId)));
+
+        assertThatThrownBy(() ->
+                expenseService.update(groupId, expenseId, req, aliceId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("Expense not found");
+    }
+
+    @Test
+    void update_shouldThrow_whenExpenseBelongsToDifferentGroup() {
+        setupGroupAndMembers();
+
+        UUID expenseId = UUID.randomUUID();
+        UUID otherGroupId = UUID.randomUUID();
+        Expense existing = existingExpense(otherGroupId, aliceId, 3L);
+        existing.setExpenseId(expenseId);
+
+        when(expenseRepository.findById(expenseId)).thenReturn(Optional.of(existing));
+
+        CreateExpenseRequest req = baseRequest(SplitMethod.EQUAL, "60.00", aliceId);
+        req.setParticipants(List.of(share(aliceId)));
+
+        assertThatThrownBy(() ->
+                expenseService.update(groupId, expenseId, req, aliceId))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("does not belong to this group");
+    }
+
+    @Test
+    void update_shouldPropagateOptimisticLockFailure() {
+        setupGroupAndMembers();
+
+        UUID expenseId = UUID.randomUUID();
+        Expense existing = existingExpense(groupId, aliceId, 3L);
+        existing.setExpenseId(expenseId);
+
+        when(expenseRepository.findById(expenseId)).thenReturn(Optional.of(existing));
+        when(expenseRepository.saveAndFlush(any(Expense.class)))
+                .thenThrow(new OptimisticLockingFailureException("simulated conflict"));
+
+        CreateExpenseRequest req = baseRequest(SplitMethod.EQUAL, "90.00", aliceId);
+        req.setParticipants(List.of(share(aliceId), share(bobId), share(carolId)));
+
+        assertThatThrownBy(() ->
+                expenseService.update(groupId, expenseId, req, aliceId))
+                .isInstanceOf(OptimisticLockingFailureException.class);
+    }
+
+    @Test
+    void update_shouldChangeSplitMethod() {
+        setupGroupAndMembers();
+
+        UUID expenseId = UUID.randomUUID();
+        Expense existing = existingExpense(groupId, aliceId, 1L);
+        existing.setExpenseId(expenseId);
+
+        when(expenseRepository.findById(expenseId)).thenReturn(Optional.of(existing));
+        when(expenseRepository.saveAndFlush(any(Expense.class)))
+                .thenAnswer(inv -> inv.getArgument(0));
+        when(expenseSplitRepository.findAllByExpenseExpenseId(expenseId))
+                .thenReturn(List.of());
+
+        // Change from EQUAL (initial) to CUSTOM
+        CreateExpenseRequest req = baseRequest(SplitMethod.CUSTOM, "90.00", aliceId);
+        req.setParticipants(List.of(
+                amt(aliceId, "50.00"),
+                amt(bobId,   "30.00"),
+                amt(carolId, "10.00")
+        ));
+
+        expenseService.update(groupId, expenseId, req, aliceId);
+
+        List<ExpenseSplit> saved = captureSavedSplits();
+        assertThat(saved.get(0).getAmountOwed()).isEqualByComparingTo("50.00");
+        assertThat(saved.get(1).getAmountOwed()).isEqualByComparingTo("30.00");
+        assertThat(saved.get(2).getAmountOwed()).isEqualByComparingTo("10.00");
+    }
+
+    // ═════════════════════════════════════════════════════════
     // Helpers
-    // ─────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════
     private void setupGroupAndMembers() {
         Group group = Group.builder().groupId(groupId).currency("SGD").build();
-        when(groupRepository.findById(groupId)).thenReturn(Optional.of(group));
+        lenient().when(groupRepository.findById(groupId)).thenReturn(Optional.of(group));
 
-        when(groupMemberRepository.existsByGroupGroupIdAndUserUserId(groupId, aliceId)).thenReturn(true);
-        when(groupMemberRepository.existsByGroupGroupIdAndUserUserId(groupId, bobId)).thenReturn(true);
-        when(groupMemberRepository.existsByGroupGroupIdAndUserUserId(groupId, carolId)).thenReturn(true);
+        lenient().when(groupMemberRepository.existsByGroupGroupIdAndUserUserId(groupId, aliceId)).thenReturn(true);
+        lenient().when(groupMemberRepository.existsByGroupGroupIdAndUserUserId(groupId, bobId)).thenReturn(true);
+        lenient().when(groupMemberRepository.existsByGroupGroupIdAndUserUserId(groupId, carolId)).thenReturn(true);
 
-        // use lenient as not every test reaches these lookups
         lenient().when(userRepository.findById(aliceId))
                 .thenReturn(Optional.of(User.builder().userId(aliceId).username("alice").build()));
         lenient().when(userRepository.findById(bobId))
@@ -227,6 +366,20 @@ class ExpenseServiceTest {
 
         lenient().when(expenseRepository.saveAndFlush(any(Expense.class)))
                 .thenAnswer(inv -> inv.getArgument(0));
+    }
+
+    private Expense existingExpense(UUID gid, UUID payerId, long version) {
+        return Expense.builder()
+                .expenseId(UUID.randomUUID())
+                .group(Group.builder().groupId(gid).currency("SGD").build())
+                .paidBy(User.builder().userId(payerId).username("payer").build())
+                .createdBy(User.builder().userId(payerId).username("payer").build())
+                .description("Original")
+                .total(new BigDecimal("60.00"))
+                .currency("SGD")
+                .splitMethod(SplitMethod.EQUAL)
+                .version(version)
+                .build();
     }
 
     private CreateExpenseRequest baseRequest(SplitMethod method, String total, UUID payerId) {

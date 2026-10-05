@@ -29,6 +29,16 @@ public class ExpenseController {
                 .body(expenseService.create(groupId, req, caller.getUserId()));
     }
 
+    @PutMapping
+    public ResponseEntity<ExpenseResponse> update(
+            @PathVariable UUID groupId,
+            @PathVariable UUID expenseId,
+            @Valid @RequestBody CreateExpenseRequest req,
+            @AuthenticationPrincipal User caller
+    ) {
+        return ResponseEntity.ok(expenseService.update(groupId, expenseId, req, caller.getUserId()));
+    }
+
     @GetMapping
     public ResponseEntity<List<ExpenseResponse>> list(
             @PathVariable UUID groupId,

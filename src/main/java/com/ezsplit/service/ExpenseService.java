@@ -2,10 +2,14 @@ package com.ezsplit.service;
 
 import com.ezsplit.dto.request.CreateExpenseRequest;
 import com.ezsplit.dto.response.ExpenseResponse;
-import com.ezsplit.entity.*;
+import com.ezsplit.entity.Expense;
+import com.ezsplit.entity.ExpenseSplit;
+import com.ezsplit.entity.Group;
+import com.ezsplit.entity.User;
 import com.ezsplit.exception.BusinessException;
 import com.ezsplit.repository.*;
 import lombok.RequiredArgsConstructor;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -32,53 +36,76 @@ public class ExpenseService {
 
         User payer = userRepository.findById(req.getPaidByUserId())
                 .orElseThrow(() -> new BusinessException("Payer not found"));
-        requireMembership(groupId, payer.getUserId());
-
         User creator = userRepository.findById(callerUserId)
                 .orElseThrow(() -> new BusinessException("Creator not found"));
 
-        BigDecimal total = req.getTotal().setScale(MONEY_SCALE, RoundingMode.HALF_UP);
-        if (total.compareTo(BigDecimal.ZERO) <= 0) {
-            throw new BusinessException("Total must be greater than zero");
-        }
-
-        if (req.getParticipants() == null || req.getParticipants().isEmpty()) {
-            throw new BusinessException("At least one participant is required");
-        }
-
-        // Validate all participants are members
-        for (var p : req.getParticipants()) {
-            requireMembership(groupId, p.getUserId());
-        }
-
-        Map<UUID, BigDecimal> shares = computeShares(req);
+        Map<UUID, BigDecimal> shares = validateAndCompute(groupId, req, callerUserId);
 
         Expense expense = Expense.builder()
                 .group(group)
                 .paidBy(payer)
                 .createdBy(creator)
                 .description(req.getDescription().trim())
-                .total(total)
+                .total(req.getTotal().setScale(MONEY_SCALE, RoundingMode.HALF_UP))
                 .currency(group.getCurrency())
                 .category(req.getCategory())
                 .splitMethod(req.getSplitMethod())
                 .build();
 
         Expense saved = expenseRepository.saveAndFlush(expense);
+        persistSplits(saved, shares);
 
-        List<ExpenseSplit> splitEntities = new ArrayList<>();
-        for (Map.Entry<UUID, BigDecimal> e : shares.entrySet()) {
-            User participant = userRepository.findById(e.getKey())
-                    .orElseThrow(() -> new BusinessException("Participant not found"));
-            splitEntities.add(ExpenseSplit.builder()
-                    .expense(saved)
-                    .user(participant)
-                    .amountOwed(e.getValue())
-                    .build());
+        return toResponse(saved, expenseSplitRepository.findAllByExpenseExpenseId(saved.getExpenseId()));
+    }
+
+    /**
+     * Updates an existing expense. Recomputes and replaces all splits.
+     * Uses optimistic locking via {@code Expense.version} to detect concurrent edits.
+     *
+     * @param groupId   the group the expense belongs to
+     * @param expenseId the expense to update
+     * @param req       the new values
+     * @param callerUserId the authenticated user making the request
+     * @return the updated expense
+     * @throws BusinessException if the expense doesn't exist, the caller isn't a member,
+     *                           or the request fails validation
+     * @throws OptimisticLockingFailureException if the expense was modified by someone
+     *                           else between read and write
+     */
+    @Transactional
+    public ExpenseResponse update(UUID groupId,
+                                  UUID expenseId,
+                                  CreateExpenseRequest req,
+                                  UUID callerUserId) {
+        requireMembership(groupId, callerUserId);
+        Expense expense = expenseRepository.findById(expenseId)
+                .orElseThrow(() -> new BusinessException("Expense not found"));
+
+        if (!expense.getGroup().getGroupId().equals(groupId)) {
+            throw new BusinessException("Expense does not belong to this group");
         }
-        expenseSplitRepository.saveAll(splitEntities);
 
-        return toResponse(saved, splitEntities);
+        Map<UUID, BigDecimal> newShares = validateAndCompute(groupId, req, callerUserId);
+
+        User newPayer = userRepository.findById(req.getPaidByUserId())
+                .orElseThrow(() -> new BusinessException("Payer not found"));
+
+        // update expense fields
+        expense.setDescription(req.getDescription().trim());
+        expense.setTotal(req.getTotal().setScale(MONEY_SCALE, RoundingMode.HALF_UP));
+        expense.setCategory(req.getCategory());
+        expense.setSplitMethod(req.getSplitMethod());
+        expense.setPaidBy(newPayer);
+
+        // delete old splits, insert new ones
+        expenseSplitRepository.deleteAllByExpenseExpenseId(expenseId);
+
+        // saveAndFlush triggers the version check immediately
+        Expense saved = expenseRepository.saveAndFlush(expense);
+
+        persistSplits(saved, newShares);
+
+        return toResponse(saved, expenseSplitRepository.findAllByExpenseExpenseId(saved.getExpenseId()));
     }
 
     @Transactional(readOnly = true)
@@ -135,7 +162,6 @@ public class ExpenseService {
     private Map<UUID, BigDecimal> computePercentage(
             List<CreateExpenseRequest.ParticipantShare> participants,
             BigDecimal total) {
-
         BigDecimal pctSum = BigDecimal.ZERO;
         for (var p : participants) {
             if (p.getPercentage() == null) {
@@ -189,6 +215,50 @@ public class ExpenseService {
         }
 
         return result;
+    }
+
+    /**
+     * Validates an expense request against the group and computes the split.
+     * Shared between create and update.
+     *
+     * @return the computed per-user amounts, keyed by user ID
+     */
+    private Map<UUID, BigDecimal> validateAndCompute(
+            UUID groupId,
+            CreateExpenseRequest req,
+            UUID callerUserId) {
+        User payer = userRepository.findById(req.getPaidByUserId())
+                .orElseThrow(() -> new BusinessException("Payer not found"));
+        requireMembership(groupId, payer.getUserId());
+
+        if (req.getParticipants() == null || req.getParticipants().isEmpty()) {
+            throw new BusinessException("At least one participant is required");
+        }
+
+        for (var p : req.getParticipants()) {
+            requireMembership(groupId, p.getUserId());
+        }
+
+        BigDecimal total = req.getTotal().setScale(MONEY_SCALE, RoundingMode.HALF_UP);
+        if (total.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new BusinessException("Total must be greater than zero");
+        }
+
+        return computeShares(req);
+    }
+
+    private void persistSplits(Expense expense, Map<UUID, BigDecimal> shares) {
+        List<ExpenseSplit> splits = new ArrayList<>();
+        for (var entry : shares.entrySet()) {
+            User participant = userRepository.findById(entry.getKey())
+                    .orElseThrow(() -> new BusinessException("Participant not found"));
+            splits.add(ExpenseSplit.builder()
+                    .expense(expense)
+                    .user(participant)
+                    .amountOwed(entry.getValue())
+                    .build());
+        }
+        expenseSplitRepository.saveAll(splits);
     }
 
     /**
